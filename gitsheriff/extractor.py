@@ -1,469 +1,475 @@
 """
-GitSheriff - Git repository extractor/recovers module.
+GitSheriff - .git repository recovery module.
 
-Recovers source code from a dumped .git directory by parsing
-commits, trees, and blobs.
+Recovers source files from dumped .git directories by traversing
+all commits, trees, and blobs. Mirrors DotGit's extractor.sh behavior:
+iterates ALL objects in .git/objects/, identifies commits, traverses
+each commit, and outputs files into numbered folders per commit.
 """
 
 import os
-import re
 import sys
-import time
-import zlib
-import stat
 import subprocess
-from datetime import datetime
+import time
+from collections import defaultdict
 
 from .utils import (
     Colors, print_info, print_success, print_warning, print_error,
-    print_section, ProgressBar, safe_makedirs, safe_write,
+    print_section, ProgressBar, safe_makedirs,
 )
 
 
-class GitExtractor:
-    """Recovers source code from a dumped .git directory."""
+def _run_git(args, git_dir, capture=True):
+    """Run a git command and return the output.
 
-    # Git object types
-    OBJ_COMMIT = 1
-    OBJ_TREE = 2
-    OBJ_BLOB = 3
-    OBJ_TAG = 4
+    Args:
+        args: List of git command arguments.
+        git_dir: Path to the .git directory.
+        capture: Whether to capture stdout.
 
-    def __init__(self, git_dir, output_dir=None):
-        """
-        Initialize the GitExtractor.
+    Returns:
+        String output of the command, or None on failure.
+    """
+    env = os.environ.copy()
+    env["GIT_DIR"] = git_dir
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["LC_ALL"] = "C"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["HOME"] = os.devnull
 
-        Args:
-            git_dir: Path to the dumped .git directory.
-            output_dir: Directory to extract files to. Defaults to parent of git_dir.
-        """
-        self.git_dir = os.path.abspath(git_dir)
-        self.output_dir = output_dir or os.path.dirname(self.git_dir)
-        self.objects = {}
-        self.errors = []
-        self.extracted_files = 0
-
-    def _get_object_path(self, sha1):
-        """Get the file path for a loose git object.
-
-        Args:
-            sha1: 40-character hex SHA1 hash.
-
-        Returns:
-            Path to the object file, or None if not found.
-        """
-        prefix = sha1[:2]
-        suffix = sha1[2:]
-        loose_path = os.path.join(self.git_dir, "objects", prefix, suffix)
-        if os.path.exists(loose_path):
-            return loose_path
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            env=env,
+            capture_output=capture,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return None
+    except FileNotFoundError:
+        print_error("Git is not installed or not in PATH.")
+        print_info("Install git: https://git-scm.com/downloads")
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
         return None
 
-    def _read_object(self, sha1):
-        """Read and decompress a git object.
 
+def _get_object_type(git_dir, sha1):
+    """Get the type of a git object (commit, tree, blob, tag).
+
+    Returns:
+        String type name, or None on failure.
+    """
+    output = _run_git(["cat-file", "-t", sha1], git_dir)
+    if output:
+        return output.strip()
+    return None
+
+
+def _get_object_content(git_dir, sha1):
+    """Get the content of a git object.
+
+    Returns:
+        String content, or None on failure.
+    """
+    return _run_git(["cat-file", "-p", sha1], git_dir)
+
+
+def _get_tree_entries(git_dir, sha1):
+    """Get entries in a tree object.
+
+    Returns:
+        List of (mode, type, hash, name) tuples, or empty list.
+    """
+    content = _get_object_content(git_dir, sha1)
+    if not content:
+        return []
+
+    entries = []
+    for line in content.strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            meta = parts[0].split(" ", 2)
+            if len(meta) == 3:
+                entries.append((meta[0], meta[1], meta[2], parts[1]))
+    return entries
+
+
+def _resolve_commit_tree(git_dir, commit_hash):
+    """Get the tree hash for a commit.
+
+    Returns:
+        Tree hash string, or None on failure.
+    """
+    content = _get_object_content(git_dir, commit_hash)
+    if not content:
+        return None
+    for line in content.splitlines():
+        if line.startswith("tree "):
+            return line.split(" ", 1)[1].strip()
+    return None
+
+
+def _traverse_tree(git_dir, tree_hash, path_prefix=""):
+    """Recursively traverse a tree and yield (mode, hash, filepath) for all blobs.
+
+    Yields:
+        Tuple of (mode, blob_hash, relative_filepath).
+    """
+    entries = _get_tree_entries(git_dir, tree_hash)
+    for mode, obj_type, obj_hash, name in entries:
+        full_path = os.path.join(path_prefix, name) if path_prefix else name
+        if obj_type == "blob":
+            yield (mode, obj_hash, full_path)
+        elif obj_type == "tree":
+            yield from _traverse_tree(git_dir, obj_hash, full_path)
+
+
+def _write_blob(git_dir, blob_hash, output_path):
+    """Write a blob object to a file.
+
+    Returns:
+        True on success, False on failure.
+    """
+    content = _get_object_content(git_dir, blob_hash)
+    if content is None:
+        return False
+    try:
+        dir_name = os.path.dirname(output_path)
+        if dir_name:
+            safe_makedirs(dir_name)
+        with open(output_path, "wb") as f:
+            f.write(content.encode("utf-8", errors="replace"))
+        return True
+    except Exception:
+        return False
+
+
+def _get_commit_info(git_dir, commit_hash):
+    """Get commit metadata (author, date, message).
+
+    Returns:
+        Dict with keys: hash, author, date, message, parents.
+    """
+    content = _get_object_content(git_dir, commit_hash)
+    if not content:
+        return None
+
+    info = {
+        "hash": commit_hash,
+        "author": "",
+        "date": "",
+        "message": "",
+        "parents": [],
+    }
+
+    lines = content.splitlines()
+    message_started = False
+    message_lines = []
+
+    for line in lines:
+        if line.startswith("author "):
+            info["author"] = line[7:]
+        elif line.startswith("committer "):
+            # Extract date from committer line
+            parts = line.split(">", 1)
+            if len(parts) > 1:
+                date_part = parts[1].strip()
+                info["date"] = date_part.split(" ")[0] if date_part else ""
+        elif line.startswith("parent "):
+            info["parents"].append(line.split(" ", 1)[1].strip())
+        elif message_started:
+            message_lines.append(line)
+        elif line == "":
+            message_started = True
+
+    info["message"] = "\n".join(message_lines).strip()
+    return info
+
+
+class GitExtractor:
+    """Recovers source files from a dumped .git directory.
+
+    Mirrors DotGit's extractor.sh behavior:
+    - Iterates ALL files in .git/objects/
+    - Identifies all commit objects
+    - Traverses each commit's tree
+    - Outputs files into numbered folders: <N>-<commit_hash>/
+    """
+
+    def __init__(self, git_dir, output_dir=None, keep_unreachable=False):
+        """
         Args:
-            sha1: 40-character hex SHA1 hash.
+            git_dir: Path to the .git directory.
+            output_dir: Directory to write recovered files. Defaults to 'recovered'.
+            keep_unreachable: Include unreachable objects.
+        """
+        self.git_dir = os.path.abspath(git_dir)
+        self.output_dir = output_dir or os.path.join(
+            os.path.dirname(self.git_dir), "recovered"
+        )
+        self.keep_unreachable = keep_unreachable
+
+        # Tracking
+        self.commits_found = []
+        self.files_recovered = 0
+        self.errors = []
+
+    def _find_all_objects(self):
+        """Iterate ALL files in .git/objects/ and find all object hashes.
+
+        Mirrors DotGit's extractor.sh approach:
+        for file in $(find .git/objects/ -type f -not -name pack-*); do
+            hash = <2-char-prefix>/<rest-of-filename>
 
         Returns:
-            Tuple of (object_type, content_bytes) or (None, None) on failure.
+            List of 40-character hex hashes.
         """
-        if sha1 in self.objects:
-            return self.objects[sha1]
+        objects_dir = os.path.join(self.git_dir, "objects")
+        hashes = []
 
-        obj_path = self._get_object_path(sha1)
-        if not obj_path:
-            # Try pack files
-            return self._read_from_pack(sha1)
+        if not os.path.isdir(objects_dir):
+            return hashes
 
+        for prefix_dir in sorted(os.listdir(objects_dir)):
+            prefix_path = os.path.join(objects_dir, prefix_dir)
+            if not os.path.isdir(prefix_path):
+                continue
+            if len(prefix_dir) != 2:
+                continue
+
+            for obj_file in sorted(os.listdir(prefix_path)):
+                # Skip pack directories and other non-object entries
+                if len(obj_file) != 38:
+                    continue
+                obj_hash = prefix_dir + obj_file
+                if all(c in "0123456789abcdef" for c in obj_hash):
+                    hashes.append(obj_hash)
+
+        return hashes
+
+    def _find_all_commits(self):
+        """Find all commit objects by iterating ALL objects.
+
+        Mirrors DotGit's extractor.sh:
+        hash=<prefix>/<rest>
+        if git cat-file -t $hash >/dev/null 2>&1; then
+            type=$(git cat-file -t $hash)
+            if [ "$type" = "commit" ]; then
+                traverse_commit $hash
+
+        Returns:
+            List of commit info dicts.
+        """
+        print_info("Scanning all objects for commits...")
+        all_objects = self._find_all_objects()
+        print_info(f"Found {len(all_objects)} object(s) in .git/objects/")
+
+        commits = []
+        progress = ProgressBar(len(all_objects), desc="Objects")
+
+        for obj_hash in all_objects:
+            obj_type = _get_object_type(self.git_dir, obj_hash)
+            if obj_type == "commit":
+                info = _get_commit_info(self.git_dir, obj_hash)
+                if info:
+                    commits.append(info)
+            progress.update()
+
+        progress.finish()
+        return commits
+
+    def _find_commits_via_refs(self):
+        """Find commits by following all refs and packed-refs.
+
+        Fallback method when .git/objects/ might be incomplete.
+
+        Returns:
+            List of commit hashes.
+        """
+        commits = set()
+
+        # Try common branch refs
+        for ref_path in [
+            "refs/heads/master", "refs/heads/main", "refs/heads/develop",
+            "refs/heads/dev", "refs/heads/HEAD",
+            "refs/remotes/origin/HEAD", "refs/remotes/origin/master",
+            "refs/remotes/origin/main",
+        ]:
+            full = os.path.join(self.git_dir, ref_path)
+            if os.path.exists(full):
+                with open(full, "r", errors="replace") as f:
+                    sha = f.read().strip()
+                    if len(sha) == 40:
+                        commits.add(sha)
+
+        # Try HEAD
+        head_file = os.path.join(self.git_dir, "HEAD")
+        if os.path.exists(head_file):
+            with open(head_file, "r", errors="replace") as f:
+                content = f.read().strip()
+                if content.startswith("ref: "):
+                    ref_name = content[5:]
+                    ref_file = os.path.join(self.git_dir, ref_name)
+                    if os.path.exists(ref_file):
+                        with open(ref_file, "r", errors="replace") as rf:
+                            sha = rf.read().strip()
+                            if len(sha) == 40:
+                                commits.add(sha)
+                elif len(content) == 40:
+                    commits.add(content)
+
+        # Try packed-refs
+        packed = os.path.join(self.git_dir, "packed-refs")
+        if os.path.exists(packed):
+            with open(packed, "r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        parts = line.split()
+                        if len(parts) >= 2 and len(parts[0]) == 40:
+                            commits.add(parts[0])
+
+        return list(commits)
+
+    def _recover_commit(self, commit_info, index):
+        """Recover all files from a single commit.
+
+        Creates output directory: <N>-<commit_hash>/
+
+        Args:
+            commit_info: Dict with hash, author, date, message, parents.
+            index: Numeric index for the output folder.
+
+        Returns:
+            Number of files recovered.
+        """
+        commit_hash = commit_info["hash"][:12]
+        folder_name = f"{index}-{commit_hash}"
+        commit_dir = os.path.join(self.output_dir, folder_name)
+
+        safe_makedirs(commit_dir)
+
+        # Get the tree for this commit
+        tree_hash = _resolve_commit_tree(self.git_dir, commit_info["hash"])
+        if not tree_hash:
+            print_warning(f"  Could not resolve tree for {commit_hash}")
+            return 0
+
+        # Write commit metadata
+        meta_path = os.path.join(commit_dir, ".commit_info.txt")
         try:
-            with open(obj_path, "rb") as f:
-                compressed = f.read()
-
-            decompressed = zlib.decompress(compressed)
-
-            # Parse git object header: "type size\0content"
-            null_idx = decompressed.index(b"\x00")
-            header = decompressed[:null_idx].decode("utf-8")
-            content = decompressed[null_idx + 1:]
-
-            obj_type_str = header.split()[0]
-            type_map = {
-                "commit": self.OBJ_COMMIT,
-                "tree": self.OBJ_TREE,
-                "blob": self.OBJ_BLOB,
-                "tag": self.OBJ_TAG,
-            }
-            obj_type = type_map.get(obj_type_str, None)
-
-            if obj_type is not None:
-                self.objects[sha1] = (obj_type, content)
-                return (obj_type, content)
-
-        except zlib.error:
-            pass
-        except FileNotFoundError:
-            pass
-        except PermissionError:
-            self.errors.append(f"Permission denied: {obj_path}")
-        except Exception as e:
-            self.errors.append(f"Error reading object {sha1}: {e}")
-
-        return (None, None)
-
-    def _read_from_pack(self, sha1):
-        """Try to read an object from pack files.
-
-        Args:
-            sha1: 40-character hex SHA1 hash.
-
-        Returns:
-            Tuple of (object_type, content_bytes) or (None, None).
-        """
-        pack_dir = os.path.join(self.git_dir, "objects", "pack")
-        if not os.path.exists(pack_dir):
-            return (None, None)
-
-        try:
-            for fname in os.listdir(pack_dir):
-                if fname.endswith(".pack"):
-                    pack_path = os.path.join(pack_dir, fname)
-                    try:
-                        result = self._extract_from_pack(pack_path, sha1)
-                        if result[0] is not None:
-                            return result
-                    except Exception:
-                        continue
-        except OSError:
-            pass
-
-        return (None, None)
-
-    def _extract_from_pack(self, pack_path, sha1):
-        """Extract an object from a pack file.
-
-        This is a simplified implementation that handles basic pack files.
-        For complex pack files, use git's native tools.
-
-        Args:
-            pack_path: Path to the .pack file.
-            sha1: 40-character hex SHA1 hash.
-
-        Returns:
-            Tuple of (object_type, content_bytes) or (None, None).
-        """
-        try:
-            # Try using git verify-pack to find the object offset
-            idx_path = pack_path.replace(".pack", ".idx")
-            if not os.path.exists(idx_path):
-                return (None, None)
-
-            # Use git cat-file if available
-            result = subprocess.run(
-                ["git", "cat-file", "-t", sha1],
-                capture_output=True,
-                text=True,
-                cwd=os.path.dirname(self.git_dir),
-                timeout=10,
-            )
-
-            if result.returncode == 0:
-                obj_type_str = result.stdout.strip()
-                type_map = {
-                    "commit": self.OBJ_COMMIT,
-                    "tree": self.OBJ_TREE,
-                    "blob": self.OBJ_BLOB,
-                    "tag": self.OBJ_TAG,
-                }
-                obj_type = type_map.get(obj_type_str)
-                if obj_type is None:
-                    return (None, None)
-
-                result = subprocess.run(
-                    ["git", "cat-file", sha1],
-                    capture_output=True,
-                    cwd=os.path.dirname(self.git_dir),
-                    timeout=10,
-                )
-
-                if result.returncode == 0:
-                    self.objects[sha1] = (obj_type, result.stdout)
-                    return (obj_type, result.stdout)
-
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass
-
-        return (None, None)
-
-    def _parse_tree(self, content):
-        """Parse a git tree object.
-
-        Args:
-            content: Raw tree content bytes.
-
-        Returns:
-            List of (mode, name, sha1) tuples.
-        """
-        entries = []
-        idx = 0
-        while idx < len(content):
-            try:
-                # Parse mode (decimal string followed by space)
-                space_idx = content.index(b" ", idx)
-                mode = content[idx:space_idx].decode("utf-8")
-
-                # Parse name (null-terminated string)
-                idx = space_idx + 1
-                null_idx = content.index(b"\x00", idx)
-                name = content[idx:null_idx].decode("utf-8")
-
-                # Parse SHA1 (20 bytes binary)
-                idx = null_idx + 1
-                sha1_binary = content[idx:idx + 20]
-                sha1 = sha1_binary.hex()
-
-                entries.append((mode, name, sha1))
-                idx = idx + 20
-
-            except (ValueError, UnicodeDecodeError):
-                break
-
-        return entries
-
-    def _extract_tree(self, tree_sha1, target_dir, depth=0):
-        """Recursively extract a git tree.
-
-        Args:
-            tree_sha1: SHA1 of the tree object.
-            target_dir: Directory to extract files to.
-            depth: Current recursion depth (for protection against infinite loops).
-        """
-        if depth > 50:
-            self.errors.append(f"Max recursion depth exceeded for tree {tree_sha1}")
-            return
-
-        obj_type, content = self._read_object(tree_sha1)
-        if obj_type != self.OBJ_TREE or content is None:
-            return
-
-        entries = self._parse_tree(content)
-
-        for mode, name, sha1 in entries:
-            # Sanitize path to prevent directory traversal
-            safe_name = os.path.basename(name)
-            if safe_name != name:
-                self.errors.append(f"Path traversal attempt blocked: {name}")
-
-            entry_path = os.path.join(target_dir, safe_name)
-
-            if mode.startswith("10"):  # Regular file
-                obj_type, blob_content = self._read_object(sha1)
-                if obj_type == self.OBJ_BLOB and blob_content is not None:
-                    try:
-                        safe_makedirs(os.path.dirname(entry_path))
-                        with open(entry_path, "wb") as f:
-                            f.write(blob_content)
-
-                        # Set executable bit if needed
-                        if mode in ("100755",):
-                            os.chmod(entry_path, os.stat(entry_path).st_mode | stat.S_IEXEC)
-
-                        self.extracted_files += 1
-                    except Exception as e:
-                        self.errors.append(f"Failed to write {entry_path}: {e}")
-
-            elif mode.startswith("04"):  # Directory
-                safe_makedirs(entry_path)
-                self._extract_tree(sha1, entry_path, depth + 1)
-
-            elif mode == "120000":  # Symlink
-                obj_type, blob_content = self._read_object(sha1)
-                if obj_type == self.OBJ_BLOB and blob_content is not None:
-                    try:
-                        link_target = blob_content.decode("utf-8").strip()
-                        if os.path.exists(entry_path):
-                            os.remove(entry_path)
-                        os.symlink(link_target, entry_path)
-                        self.extracted_files += 1
-                    except Exception as e:
-                        self.errors.append(f"Failed to create symlink {entry_path}: {e}")
-
-    def _get_commit_tree(self, commit_sha1):
-        """Extract the tree SHA1 from a commit object.
-
-        Args:
-            commit_sha1: SHA1 of the commit object.
-
-        Returns:
-            Tree SHA1 string, or None on failure.
-        """
-        obj_type, content = self._read_object(commit_sha1)
-        if obj_type != self.OBJ_COMMIT or content is None:
-            return None
-
-        try:
-            text = content.decode("utf-8", errors="replace")
-            for line in text.split("\n"):
-                if line.startswith("tree "):
-                    return line.split()[1]
+            with open(meta_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(f"Hash: {commit_info['hash']}\n")
+                f.write(f"Author: {commit_info['author']}\n")
+                f.write(f"Date: {commit_info['date']}\n")
+                f.write(f"Message: {commit_info['message']}\n")
+                f.write(f"Parents: {', '.join(commit_info['parents'])}\n")
         except Exception:
             pass
 
-        return None
+        # Traverse the tree and write files
+        count = 0
+        for mode, blob_hash, rel_path in _traverse_tree(self.git_dir, tree_hash):
+            out_path = os.path.join(commit_dir, rel_path)
+            if _write_blob(self.git_dir, blob_hash, out_path):
+                count += 1
+                # Set executable permission if needed
+                if mode and mode.startswith("100755"):
+                    try:
+                        os.chmod(out_path, 0o755)
+                    except Exception:
+                        pass
 
-    def _resolve_head(self):
-        """Resolve HEAD to a commit SHA1.
-
-        Returns:
-            SHA1 of the HEAD commit, or None.
-        """
-        head_path = os.path.join(self.git_dir, "HEAD")
-        if not os.path.exists(head_path):
-            return None
-
-        try:
-            with open(head_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read().strip()
-
-            if content.startswith("ref:"):
-                # Symbolic reference
-                ref_path = content.split(" ")[1].strip()
-                ref_file = os.path.join(self.git_dir, ref_path)
-                if os.path.exists(ref_file):
-                    with open(ref_file, "r", encoding="utf-8", errors="replace") as rf:
-                        sha = rf.read().strip()
-                        if len(sha) == 40:
-                            return sha
-            elif len(content) == 40:
-                # Detached HEAD
-                return content
-
-        except Exception as e:
-            self.errors.append(f"Failed to resolve HEAD: {e}")
-
-        return None
-
-    def _find_commits_from_refs(self):
-        """Find commit SHA1s from all available references.
-
-        Returns:
-            List of (ref_name, commit_sha1) tuples.
-        """
-        commits = []
-        refs_dir = os.path.join(self.git_dir, "refs")
-
-        if not os.path.exists(refs_dir):
-            return commits
-
-        for root, dirs, files in os.walk(refs_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                rel_path = os.path.relpath(fpath, self.git_dir)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                        sha = f.read().strip()
-                        if len(sha) == 40:
-                            commits.append((rel_path, sha))
-                except Exception:
-                    continue
-
-        # Also check packed-refs
-        packed_path = os.path.join(self.git_dir, "packed-refs")
-        if os.path.exists(packed_path):
-            try:
-                with open(packed_path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                sha = parts[0]
-                                ref = parts[1]
-                                if len(sha) == 40:
-                                    commits.append((ref, sha))
-            except Exception:
-                pass
-
-        return commits
+        return count
 
     def extract(self):
-        """Execute the full extraction.
+        """Execute full extraction from a dumped .git directory.
+
+        Mirrors DotGit's extractor.sh workflow:
+        1. Find ALL objects in .git/objects/
+        2. Identify ALL commit objects
+        3. For each commit, traverse its tree
+        4. Output files into <N>-<commit_hash>/ folders
 
         Returns:
-            True on success, False on failure.
+            Tuple of (success_bool, output_dir_string).
         """
-        print_section("Git Repository Extraction")
+        print_section("Git Repository Recovery")
         print_info(f"Git directory: {self.git_dir}")
-        print_info(f"Output directory: {self.output_dir}")
+        print_info(f"Output: {self.output_dir}")
         print()
+
+        if not os.path.isdir(self.git_dir):
+            print_error(f"Git directory not found: {self.git_dir}")
+            return False, self.output_dir
 
         start_time = time.time()
 
         try:
-            # Check if git_dir exists
-            if not os.path.exists(self.git_dir):
-                print_error(f"Git directory not found: {self.git_dir}")
-                return False
+            safe_makedirs(self.output_dir)
 
-            # Resolve HEAD
-            head_sha = self._resolve_head()
-            if head_sha:
-                print_info(f"HEAD: {head_sha[:12]}...")
-            else:
-                print_warning("Could not resolve HEAD")
+            # Step 1: Find all commits via objects scan (primary method)
+            self.commits_found = self._find_all_commits()
 
-            # Find all commits from refs
-            refs = self._find_commits_from_refs()
-            if refs:
-                print_info(f"Found {len(refs)} reference(s)")
-                for ref_name, sha in refs[:5]:
-                    print(f"    {ref_name}: {sha[:12]}...")
-                if len(refs) > 5:
-                    print(f"    ... and {len(refs) - 5} more")
-            else:
-                print_warning("No references found")
+            # Step 2: Fallback - find commits via refs if no commits found via objects
+            if not self.commits_found:
+                print_info("No commits found via objects, trying refs...")
+                ref_hashes = self._find_commits_via_refs()
+                for h in ref_hashes:
+                    info = _get_commit_info(self.git_dir, h)
+                    if info:
+                        self.commits_found.append(info)
 
-            # Extract from HEAD commit
-            if head_sha:
-                tree_sha = self._get_commit_tree(head_sha)
-                if tree_sha:
-                    print_info(f"Extracting from HEAD tree {tree_sha[:12]}...")
-                    extract_dir = os.path.join(self.output_dir, "extracted")
-                    safe_makedirs(extract_dir)
-                    self._extract_tree(tree_sha, extract_dir)
-                else:
-                    print_warning("Could not find tree in HEAD commit")
+            if not self.commits_found:
+                print_warning("No commits found.")
+                print_info("Trying to recover files from HEAD...")
+                head_file = os.path.join(self.git_dir, "HEAD")
+                if os.path.exists(head_file):
+                    with open(head_file, "r", errors="replace") as f:
+                        head_content = f.read().strip()
+                    print_info(f"HEAD points to: {head_content}")
+                return True, self.output_dir
 
-            # Also try to extract from other refs
-            for ref_name, sha in refs[:3]:
-                if sha == head_sha:
-                    continue
-                tree_sha = self._get_commit_tree(sha)
-                if tree_sha:
-                    safe_ref = ref_name.replace("/", "_").replace("\\", "_")
-                    extract_dir = os.path.join(self.output_dir, f"extracted_{safe_ref}")
-                    safe_makedirs(extract_dir)
-                    self._extract_tree(tree_sha, extract_dir)
+            print_success(f"Found {len(self.commits_found)} commit(s)")
+            print()
+
+            # Step 3: Recover each commit
+            total_files = 0
+            for i, commit_info in enumerate(self.commits_found, 1):
+                hash_short = commit_info["hash"][:12]
+                msg_preview = commit_info["message"][:60] if commit_info["message"] else "(no message)"
+                print_info(
+                    f"Commit {i}/{len(self.commits_found)}: "
+                    f"{hash_short} - {msg_preview}"
+                )
+
+                files = self._recover_commit(commit_info, i)
+                total_files += files
+                print_success(f"  Recovered {files} file(s)")
+
+            self.files_recovered = total_files
 
             # Summary
             elapsed = time.time() - start_time
-            print_section("Extraction Summary")
-            print_success(f"Files extracted: {self.extracted_files}")
+            print_section("Recovery Summary")
+            print_success(f"Commits processed: {len(self.commits_found)}")
+            print_success(f"Total files recovered: {self.files_recovered}")
             print_success(f"Output directory: {self.output_dir}")
+            print_success(f"Time elapsed: {elapsed:.1f}s")
 
             if self.errors:
                 print_warning(f"Errors: {len(self.errors)}")
-                for err in self.errors[:5]:
-                    print(f"    {Colors.RED}{err}{Colors.END}")
-                if len(self.errors) > 5:
-                    print(f"    ... and {len(self.errors) - 5} more")
 
-            print_success(f"Time elapsed: {elapsed:.1f}s")
-            return True
+            return True, self.output_dir
 
         except KeyboardInterrupt:
             print_warning("\nExtraction interrupted by user.")
-            return False
+            return False, self.output_dir
         except Exception as e:
             print_error(f"Extraction failed: {e}")
-            return False
+            return False, self.output_dir

@@ -2,7 +2,8 @@
 GitSheriff - .git repository dumper module.
 
 Downloads exposed .git directories by recursively fetching objects,
-packs, and reference files.
+packs, and reference files. Mirrors DotGit's gitdumper.sh behavior
+with expanded file list, binary hash extraction, and object guessing.
 """
 
 import os
@@ -24,39 +25,64 @@ from .utils import (
 )
 
 
-# Files to fetch from the .git directory
+# ---------------------------------------------------------------------------
+# Initial files to fetch (mirrors DotGit's gitdumper.sh + extras)
+# ---------------------------------------------------------------------------
 GIT_FILES = [
+    # Core
     "HEAD",
     "config",
     "description",
     "index",
+    "COMMIT_EDITMSG",
+
+    # Refs
     "packed-refs",
     "refs/heads/master",
     "refs/heads/main",
     "refs/heads/develop",
     "refs/heads/dev",
-    "refs/heads/feature/*",
-    "refs/heads/release/*",
-    "refs/heads/hotfix/*",
     "refs/remotes/origin/HEAD",
     "refs/remotes/origin/master",
     "refs/remotes/origin/main",
     "refs/stash",
+    "refs/tags/*",
+
+    # Logs
+    "logs/HEAD",
+    "logs/refs/heads/master",
+    "logs/refs/heads/main",
+    "logs/refs/remotes/origin/HEAD",
+    "logs/refs/remotes/origin/master",
+
+    # Info
+    "info/refs",
     "info/exclude",
     "objects/info/packs",
-    "COMMIT_EDITMSG",
-    "FETCH_HEAD",
+
+    # Merge/rebase state
     "MERGE_HEAD",
     "ORIG_HEAD",
-    "rebase-apply/pad",
+    "CHERRY_PICK_HEAD",
+    "REBASE_HEAD",
     "rebase-apply/onto",
     "rebase-apply/head-name",
+    "rebase-apply/pad",
     "rebase-apply/msg-body",
+
+    # Magit / wip refs
+    "refs/wip/index/refs/heads/master",
+    "refs/wip/wtree/refs/heads/master",
+    "refs/wip/index/refs/heads/main",
+    "refs/wip/wtree/refs/heads/main",
+
+    # Shallow
+    "shallow",
 ]
 
-# Regex to find object hashes in git files
-OBJECT_HASH_RE = re.compile(r"[0-9a-f]{40}")
-PACK_HASH_RE = re.compile(r"[0-9a-f]{40}")
+# Regex patterns for extracting hashes from text and binary content
+HASH_RE = re.compile(rb"[0-9a-f]{40}")
+PACK_RE = re.compile(rb"pack-[0-9a-f]{40}")
 
 
 class GitDumper:
@@ -103,21 +129,11 @@ class GitDumper:
         return os.path.join("dumped", domain)
 
     def _git_url(self, path):
-        """Build a full URL for a .git file.
-
-        Args:
-            path: Relative path within .git directory.
-
-        Returns:
-            Full URL string.
-        """
+        """Build a full URL for a .git file."""
         return f"{self.url}/{path}"
 
     def _fetch_file(self, path):
         """Fetch a single file from the .git directory.
-
-        Args:
-            path: Relative path within .git directory.
 
         Returns:
             Tuple of (path, content_bytes, success_bool).
@@ -134,10 +150,7 @@ class GitDumper:
 
             if response.status_code == 200 and len(response.content) > 0:
                 return (path, response.content, True)
-            elif response.status_code == 404:
-                return (path, b"", False)
-            else:
-                return (path, b"", False)
+            return (path, b"", False)
 
         except requests.exceptions.SSLError:
             try:
@@ -153,20 +166,15 @@ class GitDumper:
             except Exception:
                 return (path, b"", False)
 
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException):
             return (path, b"", False)
-        except requests.exceptions.Timeout:
-            return (path, b"", False)
-        except requests.exceptions.RequestException:
-            return (path, b"", False)
-        except Exception as e:
+        except Exception:
             return (path, b"", False)
 
     def _fetch_object(self, sha1):
         """Fetch a git object by its SHA1 hash.
-
-        Args:
-            sha1: 40-character hex SHA1 hash.
 
         Returns:
             Tuple of (sha1, content_bytes, success_bool).
@@ -174,7 +182,6 @@ class GitDumper:
         if sha1 in self.downloaded:
             return (sha1, b"", False)
 
-        # Try loose object first
         prefix = sha1[:2]
         suffix = sha1[2:]
         loose_path = f"objects/{prefix}/{suffix}"
@@ -182,72 +189,44 @@ class GitDumper:
         path, content, success = self._fetch_file(loose_path)
         if success:
             self.downloaded.add(sha1)
-            # Try to decompress to get the object type
-            try:
-                decompressed = zlib.decompress(content)
-                return (sha1, content, True)
-            except zlib.error:
-                # Not a valid zlib object, might be raw
-                return (sha1, content, True)
+            return (sha1, content, True)
 
         return (sha1, b"", False)
 
-    def _discover_objects_from_refs(self):
-        """Discover object hashes from reference files.
+    # ------------------------------------------------------------------
+    # Binary hash extraction (mirrors DotGit: strings -a | grep 40-hex)
+    # ------------------------------------------------------------------
 
-        Returns:
-            Set of 40-character hex hashes.
+    def _extract_hashes_from_binary(self, data):
+        """Extract all 40-char hex strings from raw binary content.
+
+        This mirrors DotGit's approach of running 'strings -a' then
+        grepping for 40-char hex patterns on every downloaded file.
         """
-        objects = set()
-        ref_patterns = [
-            "refs/heads/*",
-            "refs/remotes/origin/*",
-            "refs/tags/*",
-        ]
+        if not data:
+            return set()
+        return {m.decode("ascii") for m in HASH_RE.findall(data)}
 
-        # Try to read HEAD first
-        head_path = os.path.join(self.git_dir, "HEAD")
-        if os.path.exists(head_path):
-            try:
-                with open(head_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read().strip()
-                    if content.startswith("ref:"):
-                        ref_path = content.split(" ")[1].strip()
-                        ref_file = os.path.join(self.git_dir, ref_path)
-                        if os.path.exists(ref_file):
-                            with open(ref_file, "r", encoding="utf-8", errors="replace") as rf:
-                                sha = rf.read().strip()
-                                if len(sha) == 40:
-                                    objects.add(sha)
-            except Exception:
-                pass
+    def _extract_hashes_from_text(self, text):
+        """Extract all 40-char hex strings from text content."""
+        if not text:
+            return set()
+        return set(re.findall(r"[0-9a-f]{40}", text))
 
-        # Scan all files in .git for object hashes
-        for root, dirs, files in os.walk(self.git_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                        for match in OBJECT_HASH_RE.finditer(content):
-                            objects.add(match.group())
-                except Exception:
-                    pass
-
-        return objects
+    def _extract_packs_from_binary(self, data):
+        """Extract pack file references from binary content."""
+        if not data:
+            return set()
+        return {m.decode("ascii") for m in PACK_RE.findall(data)}
 
     def _decompress_object(self, raw_bytes):
         """Decompress a loose git object and extract its type and content.
-
-        Args:
-            raw_bytes: Raw zlib-compressed object bytes.
 
         Returns:
             Tuple of (type_str, content_bytes) or (None, None) on failure.
         """
         try:
             decompressed = zlib.decompress(raw_bytes)
-            # Git object format: "<type> <size>\0<content>"
             null_idx = decompressed.find(b"\x00")
             if null_idx == -1:
                 return None, None
@@ -259,11 +238,7 @@ class GitDumper:
             return None, None
 
     def _extract_hashes_from_object(self, obj_type, content):
-        """Extract referenced object hashes from a git object.
-
-        Args:
-            obj_type: Object type string (commit, tree, blob, tag).
-            content: Decompressed content bytes.
+        """Extract referenced object hashes from a parsed git object.
 
         Returns:
             Set of 40-character hex hash strings.
@@ -271,7 +246,6 @@ class GitDumper:
         hashes = set()
 
         if obj_type == "commit":
-            # Commit format: tree <hash>\nparent <hash>\n...
             for line in content.decode("utf-8", errors="replace").splitlines():
                 parts = line.split(" ")
                 if len(parts) >= 2 and parts[0] in ("tree", "parent"):
@@ -280,18 +254,15 @@ class GitDumper:
                         hashes.add(h)
 
         elif obj_type == "tree":
-            # Tree format: <mode> <name>\0<20-byte-sha1> repeated
             i = 0
             while i < len(content):
                 space_idx = content.find(b" ", i)
                 null_idx = content.find(b"\x00", i)
                 if space_idx == -1 or null_idx == -1:
                     break
-                # After null byte, 20 bytes of SHA1
                 sha_start = null_idx + 1
                 if sha_start + 20 <= len(content):
-                    sha_bytes = content[sha_start:sha_start + 20]
-                    sha_hex = sha_bytes.hex()
+                    sha_hex = content[sha_start:sha_start + 20].hex()
                     if len(sha_hex) == 40:
                         hashes.add(sha_hex)
                     i = sha_start + 20
@@ -299,7 +270,6 @@ class GitDumper:
                     break
 
         elif obj_type == "tag":
-            # Tag format: similar to commit, has "object <hash>"
             for line in content.decode("utf-8", errors="replace").splitlines():
                 parts = line.split(" ")
                 if len(parts) >= 2 and parts[0] == "object":
@@ -309,15 +279,78 @@ class GitDumper:
 
         return hashes
 
+    # ------------------------------------------------------------------
+    # Reference-based object discovery
+    # ------------------------------------------------------------------
+
+    def _discover_objects_from_refs(self):
+        """Discover object hashes from all downloaded reference files.
+
+        Returns:
+            Set of 40-character hex hashes.
+        """
+        objects = set()
+
+        # Scan all files in .git for hashes and pack references
+        packs_found = set()
+        for root, dirs, files in os.walk(self.git_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                    # Extract 40-char hex hashes (from both text and binary)
+                    objects.update(self._extract_hashes_from_binary(data))
+                    # Extract pack file references
+                    packs_found.update(self._extract_packs_from_binary(data))
+                except Exception:
+                    pass
+
+        # Download any discovered pack files
+        for pack_ref in packs_found:
+            self._fetch_pack_by_ref(pack_ref)
+
+        return objects
+
+    def _fetch_pack_by_ref(self, pack_ref):
+        """Download a pack file and its index by reference name.
+
+        Args:
+            pack_ref: Pack reference like 'pack-abc123...'
+        """
+        pack_path = f"objects/pack/{pack_ref}.pack"
+        idx_path = f"objects/pack/{pack_ref}.idx"
+
+        # Check if already downloaded
+        local_pack = os.path.join(self.git_dir, pack_path)
+        if os.path.exists(local_pack):
+            return
+
+        path1, content1, ok1 = self._fetch_file(pack_path)
+        if ok1 and content1:
+            safe_makedirs(os.path.dirname(local_pack))
+            try:
+                with open(local_pack, "wb") as f:
+                    f.write(content1)
+                print_success(f"Downloaded pack: {pack_ref}.pack")
+            except Exception as e:
+                self.errors.append(f"Failed to write pack {pack_ref}: {e}")
+
+        path2, content2, ok2 = self._fetch_file(idx_path)
+        if ok2 and content2:
+            local_idx = os.path.join(self.git_dir, idx_path)
+            try:
+                with open(local_idx, "wb") as f:
+                    f.write(content2)
+            except Exception as e:
+                self.errors.append(f"Failed to write pack index {pack_ref}: {e}")
+
     def _discover_referenced_objects(self, initial_objects):
         """Recursively discover all objects referenced from initial objects.
 
         Starts with initial objects (commit hashes from refs), downloads them,
         decompresses to find referenced tree/blob hashes, and repeats until
         no new objects are found.
-
-        Args:
-            initial_objects: Set of initial object hashes to start with.
 
         Returns:
             Set of all discovered object hashes.
@@ -326,7 +359,7 @@ class GitDumper:
         to_process = list(initial_objects)
         processed = set()
 
-        max_depth = 20  # Safety limit
+        max_depth = 20
         depth = 0
 
         while to_process and depth < max_depth:
@@ -356,7 +389,7 @@ class GitDumper:
 
                 if raw_bytes is None:
                     # Need to download it first
-                    path, content, success = self._fetch_object(sha1)
+                    _, content, success = self._fetch_object(sha1)
                     if success and content:
                         obj_dir = os.path.join(self.git_dir, "objects", prefix)
                         safe_makedirs(obj_dir)
@@ -382,12 +415,86 @@ class GitDumper:
 
         return all_objects
 
-    def _download_objects(self, objects):
-        """Download a set of git objects.
+    # ------------------------------------------------------------------
+    # Object guessing (brute-force common patterns)
+    # ------------------------------------------------------------------
 
-        Args:
-            objects: Set of 40-character hex hashes to download.
+    def _guess_objects(self):
+        """Try to download objects by guessing common hash patterns.
+
+        This attempts to find objects that might not be referenced by
+        any downloaded file but exist on the server (e.g., orphaned
+        objects, objects referenced by pack indices we couldn't parse).
+
+        Returns:
+            Set of hashes that were successfully downloaded.
         """
+        found = set()
+
+        # Known special git hashes
+        special_hashes = [
+            # Empty tree (used in initial commits)
+            "4b825dc642cb6eb9a060e54bf899d91f6b682d1",
+            # Empty blob
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        ]
+
+        # Try all known commit hashes we already have - their parents' hashes
+        # by flipping bits in known hashes (a heuristic)
+        known = list(self.downloaded)
+
+        candidates = list(special_hashes)
+
+        # For each known hash, try small perturbations (common offset patterns)
+        for h in known[:50]:  # Limit to avoid excessive requests
+            # Try adjacent hashes (off-by-one in the last nibble)
+            for delta in [-1, 1, -2, 2]:
+                try:
+                    val = int(h, 16) + delta
+                    candidates.append(format(val, "040x"))
+                except ValueError:
+                    pass
+
+        # Try short-prefix brute force for objects/00/ through objects/ff/
+        # by trying 6-digit hex suffixes (small sample)
+        for prefix_byte in range(256):
+            prefix = f"{prefix_byte:02x}"
+            for suffix_sample in ["000000", "111111", "aaaaaa", "ffffff",
+                                   "012345", "abcdef", "123456", "fedcba",
+                                   "000001", "ffffff"]:
+                candidates.append(prefix + suffix_sample)
+
+        print_info(f"Guessing: trying {len(candidates)} candidate object hashes...")
+
+        for sha1 in candidates:
+            if len(sha1) != 40:
+                continue
+            if sha1 in self.downloaded:
+                continue
+
+            path, content, success = self._fetch_object(sha1)
+            if success and content:
+                found.add(sha1)
+                # Save it
+                prefix = sha1[:2]
+                suffix = sha1[2:]
+                obj_dir = os.path.join(self.git_dir, "objects", prefix)
+                safe_makedirs(obj_dir)
+                obj_path = os.path.join(obj_dir, suffix)
+                try:
+                    with open(obj_path, "wb") as f:
+                        f.write(content)
+                except Exception:
+                    pass
+
+        return found
+
+    # ------------------------------------------------------------------
+    # Download objects
+    # ------------------------------------------------------------------
+
+    def _download_objects(self, objects):
+        """Download a set of git objects."""
         if not objects:
             return
 
@@ -401,7 +508,6 @@ class GitDumper:
 
             path, content, success = self._fetch_object(sha1)
             if success and content:
-                # Save the loose object
                 prefix = sha1[:2]
                 suffix = sha1[2:]
                 obj_dir = os.path.join(self.git_dir, "objects", prefix)
@@ -418,11 +524,15 @@ class GitDumper:
 
         progress.finish()
 
+    # ------------------------------------------------------------------
+    # Main dump
+    # ------------------------------------------------------------------
+
     def dump(self):
         """Execute the full .git dump.
 
         Returns:
-            True on success, False on failure. Also returns the output_dir.
+            Tuple of (success_bool, output_dir_string).
         """
         print_section("Git Repository Dump")
         print_info(f"Target: {self.url}")
@@ -436,15 +546,12 @@ class GitDumper:
             safe_makedirs(self.git_dir)
 
             # Step 1: Fetch known git files
-            print_info("Fetching standard git files...")
-            progress = ProgressBar(len(GIT_FILES), desc="Files")
+            # Filter out wildcard patterns
+            static_files = [f for f in GIT_FILES if "*" not in f]
+            print_info(f"Fetching {len(static_files)} standard git file(s)...")
+            progress = ProgressBar(len(static_files), desc="Files")
 
-            for git_file in GIT_FILES:
-                if "*" in git_file:
-                    # Skip wildcard patterns for now
-                    progress.update()
-                    continue
-
+            for git_file in static_files:
                 path, content, success = self._fetch_file(git_file)
                 if success and content:
                     local_path = os.path.join(self.git_dir, path)
@@ -457,54 +564,34 @@ class GitDumper:
                         self.errors.append(f"Failed to write {path}: {e}")
 
                 progress.update()
-                time.sleep(0.01)  # Rate limiting
+                time.sleep(0.01)
 
             progress.finish()
 
-            # Step 2: Check for pack files
+            # Step 2: Check for pack files from packs file
             print_info("Checking for pack files...")
             packs_path = os.path.join(self.git_dir, "objects", "info", "packs")
             if os.path.exists(packs_path):
                 try:
-                    with open(packs_path, "r", encoding="utf-8", errors="replace") as f:
+                    with open(packs_path, "rb") as f:
                         pack_content = f.read()
-                    pack_hashes = PACK_HASH_RE.findall(pack_content)
+                    pack_hashes = self._extract_hashes_from_binary(pack_content)
                     if pack_hashes:
                         print_info(f"Found {len(pack_hashes)} pack file(s)")
                         for pack_hash in pack_hashes:
-                            pack_path = f"objects/pack/pack-{pack_hash}.pack"
-                            idx_path = f"objects/pack/pack-{pack_hash}.idx"
-                            path1, content1, success1 = self._fetch_file(pack_path)
-                            if success1 and content1:
-                                local_path = os.path.join(self.git_dir, pack_path)
-                                safe_makedirs(os.path.dirname(local_path))
-                                try:
-                                    with open(local_path, "wb") as f:
-                                        f.write(content1)
-                                    print_success(f"Downloaded: pack-{pack_hash}.pack")
-                                except Exception as e:
-                                    self.errors.append(f"Failed to write pack: {e}")
-
-                            path2, content2, success2 = self._fetch_file(idx_path)
-                            if success2 and content2:
-                                local_path = os.path.join(self.git_dir, idx_path)
-                                try:
-                                    with open(local_path, "wb") as f:
-                                        f.write(content2)
-                                except Exception as e:
-                                    self.errors.append(f"Failed to write pack index: {e}")
+                            self._fetch_pack_by_ref(f"pack-{pack_hash}")
                 except Exception as e:
                     print_warning(f"Failed to parse packs file: {e}")
             else:
-                print_info("No pack files found")
+                print_info("No packs file found")
 
-            # Step 3: Discover and download objects (with recursive resolution)
+            # Step 3: Discover and download objects
             if self.fetch_large_files:
                 print_info("Discovering objects from references...")
                 initial_objects = self._discover_objects_from_refs()
                 if initial_objects:
                     print_info(f"Found {len(initial_objects)} initial object(s) from refs")
-                    # Recursively discover all referenced objects (commit->tree->blob)
+                    # Recursively discover all referenced objects
                     print_info("Recursively resolving object references...")
                     all_objects = self._discover_referenced_objects(initial_objects)
                     new_objects = all_objects - initial_objects
@@ -515,12 +602,18 @@ class GitDumper:
                         )
                     self._download_objects(all_objects)
                 else:
-                    print_info("No additional objects discovered from references")
+                    print_info("No objects discovered from refs, trying object guesser...")
+                    guessed = self._guess_objects()
+                    if guessed:
+                        print_success(f"Guessed {len(guessed)} object(s) successfully")
+                    else:
+                        print_info("No objects found via guessing")
 
             # Step 4: Summary
             elapsed = time.time() - start_time
             print_section("Dump Summary")
             print_success(f"Output directory: {self.output_dir}")
+            print_success(f"Objects downloaded: {len(self.downloaded)}")
             print_success(f"Time elapsed: {elapsed:.1f}s")
 
             if self.errors:
