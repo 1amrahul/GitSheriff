@@ -37,7 +37,7 @@ def cmd_find(args):
             urls=urls,
             threads=args.threads,
             timeout=args.timeout,
-            verify_ssl=args.verify_ssl,
+            verify_ssl=not args.no_verify_ssl,
         )
         results = finder.scan()
 
@@ -88,7 +88,7 @@ def cmd_dump(args):
             output_dir=output_dir,
             threads=args.threads,
             timeout=args.timeout,
-            verify_ssl=args.verify_ssl,
+            verify_ssl=not args.no_verify_ssl,
             fetch_large_files=not args.skip_objects,
         )
 
