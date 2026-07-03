@@ -21,12 +21,6 @@ cd GitSheriff
 pip install .
 ```
 
-Or install directly from PyPI (if published):
-
-```bash
-pip install gitsheriff
-```
-
 ### Requirements
 
 - Python 3.8+
