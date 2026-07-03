@@ -7,7 +7,7 @@ name = "gitsheriff"
 version = "2.0.0"
 description = "A .git exposure detection, dumping, recovery, and sensitive data scanning toolkit"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Rahul", email = "rahul@rahulms.qzz.io"}
 ]
@@ -32,7 +32,6 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
