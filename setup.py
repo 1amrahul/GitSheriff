@@ -15,9 +15,6 @@ setup(
     },
     packages=find_packages(),
     python_requires=">=3.8",
-    install_requires=[
-        "requests>=2.25.0",
-    ],
     entry_points={
         "console_scripts": [
             "gitsheriff=gitsheriff.cli:main",
