@@ -30,60 +30,25 @@ pip install .
 pip install -r requirements.txt
 ```
 
-## Usage
+---
 
-### Scan for .git Exposure
+## Quick Start - Integrated Workflow
+
+The fastest way to use GitSheriff is the integrated dump-and-extract workflow. Just one command:
 
 ```bash
-# Scan a single URL
-python -m gitsheriff find --urls https://example.com
-
-# Scan multiple URLs
-python -m gitsheriff find --urls https://site1.com https://site2.com
-
-# Scan from a file
-cat urls.txt | python -m gitsheriff find
-
-# Save results to file
-python -m gitsheriff find --urls https://example.com --output found.txt
+gitsheriff dump https://example.com/.git
 ```
 
-### Dump an Exposed .git Repository
+This will:
+1. **Download** the exposed `.git` repository
+2. **Ask** if you want to extract/recover files
+3. **Extract** source code automatically
 
-```bash
-# Dump with automatic extraction prompt
-python -m gitsheriff dump https://example.com/.git
+### Full Example Output
 
-# Dump without extraction
-python -m gitsheriff dump https://example.com/.git --yes
-
-# Custom output directory
-python -m gitsheriff dump https://example.com/.git --output ./my_dump
-
-# Skip object downloading (faster)
-python -m gitsheriff dump https://example.com/.git --skip-objects
 ```
-
-### Extract from a Dumped .git
-
-```bash
-# Extract files from a dumped .git directory
-python -m gitsheriff extract ./dumped/example_com/.git
-
-# Extract to a specific directory
-python -m gitsheriff extract ./dumped/example_com/.git --output ./recovered
-```
-
-## Integrated Workflow
-
-GitSheriff provides a seamless dump-and-extract workflow:
-
-1. **Dump** an exposed `.git` repository
-2. After successful dump, **automatically prompt** to extract/recover files
-3. Extract source code from the dumped repository
-
-```bash
-$ python -m gitsheriff dump https://example.com/.git
+$ gitsheriff dump https://example.com/.git
 
   --- Git Repository Dump ---
   Target: https://example.com/.git
@@ -114,6 +79,63 @@ $ python -m gitsheriff dump https://example.com/.git
 
   Complete! Your extracted files are in the 'extracted' subdirectory.
 ```
+
+### Skip Extraction (Dump Only)
+
+```bash
+gitsheriff dump https://example.com/.git --yes
+```
+
+### Extract Later (From Previous Dump)
+
+```bash
+gitsheriff extract ./dumped/example_com/.git
+```
+
+---
+
+## Individual Commands
+
+### Find - Scan for .git Exposure
+
+```bash
+# Scan a single URL
+gitsheriff find --urls https://example.com
+
+# Scan multiple URLs
+gitsheriff find --urls https://site1.com https://site2.com
+
+# Scan from a file
+cat urls.txt | gitsheriff find
+
+# Save results to file
+gitsheriff find --urls https://example.com --output found.txt
+```
+
+### Dump - Download Exposed .git
+
+```bash
+# Dump with extraction prompt (default)
+gitsheriff dump https://example.com/.git
+
+# Custom output directory
+gitsheriff dump https://example.com/.git --output ./my_dump
+
+# Skip object downloading (faster)
+gitsheriff dump https://example.com/.git --skip-objects
+```
+
+### Extract - Recover Source Files
+
+```bash
+# Extract from a dumped .git directory
+gitsheriff extract ./dumped/example_com/.git
+
+# Extract to a specific directory
+gitsheriff extract ./dumped/example_com/.git --output ./recovered
+```
+
+---
 
 ## Command Line Options
 
@@ -153,15 +175,7 @@ $ python -m gitsheriff dump https://example.com/.git
 | `git_dir` | Path to the dumped .git directory |
 | `--output`, `-o` | Output directory |
 
-## Security Considerations
-
-This tool is designed for:
-- **Authorized security assessments**
-- **Penetration testing**
-- **Bug bounty programs**
-- **Security research**
-
-**Do not use this tool for unauthorized access to systems you do not own or have permission to test.**
+---
 
 ## What GitSheriff Detects
 
@@ -208,6 +222,8 @@ GitSheriff includes comprehensive error handling for:
 - Corrupted git objects
 - Invalid repository structures
 
+---
+
 ## Project Structure
 
 ```
@@ -225,6 +241,8 @@ GitSheriff/
 ├── LICENSE              # MIT License
 └── README.md            # This file
 ```
+
+---
 
 ## Contributing
 
