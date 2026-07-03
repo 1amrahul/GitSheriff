@@ -236,6 +236,152 @@ class GitDumper:
 
         return objects
 
+    def _decompress_object(self, raw_bytes):
+        """Decompress a loose git object and extract its type and content.
+
+        Args:
+            raw_bytes: Raw zlib-compressed object bytes.
+
+        Returns:
+            Tuple of (type_str, content_bytes) or (None, None) on failure.
+        """
+        try:
+            decompressed = zlib.decompress(raw_bytes)
+            # Git object format: "<type> <size>\0<content>"
+            null_idx = decompressed.find(b"\x00")
+            if null_idx == -1:
+                return None, None
+            header = decompressed[:null_idx].decode("utf-8", errors="replace")
+            obj_type = header.split(" ")[0]
+            content = decompressed[null_idx + 1:]
+            return obj_type, content
+        except (zlib.error, ValueError, IndexError):
+            return None, None
+
+    def _extract_hashes_from_object(self, obj_type, content):
+        """Extract referenced object hashes from a git object.
+
+        Args:
+            obj_type: Object type string (commit, tree, blob, tag).
+            content: Decompressed content bytes.
+
+        Returns:
+            Set of 40-character hex hash strings.
+        """
+        hashes = set()
+
+        if obj_type == "commit":
+            # Commit format: tree <hash>\nparent <hash>\n...
+            for line in content.decode("utf-8", errors="replace").splitlines():
+                parts = line.split(" ")
+                if len(parts) >= 2 and parts[0] in ("tree", "parent"):
+                    h = parts[1].strip()
+                    if len(h) == 40 and all(c in "0123456789abcdef" for c in h):
+                        hashes.add(h)
+
+        elif obj_type == "tree":
+            # Tree format: <mode> <name>\0<20-byte-sha1> repeated
+            i = 0
+            while i < len(content):
+                space_idx = content.find(b" ", i)
+                null_idx = content.find(b"\x00", i)
+                if space_idx == -1 or null_idx == -1:
+                    break
+                # After null byte, 20 bytes of SHA1
+                sha_start = null_idx + 1
+                if sha_start + 20 <= len(content):
+                    sha_bytes = content[sha_start:sha_start + 20]
+                    sha_hex = sha_bytes.hex()
+                    if len(sha_hex) == 40:
+                        hashes.add(sha_hex)
+                    i = sha_start + 20
+                else:
+                    break
+
+        elif obj_type == "tag":
+            # Tag format: similar to commit, has "object <hash>"
+            for line in content.decode("utf-8", errors="replace").splitlines():
+                parts = line.split(" ")
+                if len(parts) >= 2 and parts[0] == "object":
+                    h = parts[1].strip()
+                    if len(h) == 40 and all(c in "0123456789abcdef" for c in h):
+                        hashes.add(h)
+
+        return hashes
+
+    def _discover_referenced_objects(self, initial_objects):
+        """Recursively discover all objects referenced from initial objects.
+
+        Starts with initial objects (commit hashes from refs), downloads them,
+        decompresses to find referenced tree/blob hashes, and repeats until
+        no new objects are found.
+
+        Args:
+            initial_objects: Set of initial object hashes to start with.
+
+        Returns:
+            Set of all discovered object hashes.
+        """
+        all_objects = set(initial_objects)
+        to_process = list(initial_objects)
+        processed = set()
+
+        max_depth = 20  # Safety limit
+        depth = 0
+
+        while to_process and depth < max_depth:
+            batch = list(to_process)
+            to_process = []
+            depth += 1
+
+            print_info(f"  Resolving objects (depth {depth}, {len(batch)} to inspect)...")
+
+            for sha1 in batch:
+                if sha1 in processed:
+                    continue
+                processed.add(sha1)
+
+                # Read the local object file if we have it
+                prefix = sha1[:2]
+                suffix = sha1[2:]
+                obj_path = os.path.join(self.git_dir, "objects", prefix, suffix)
+
+                raw_bytes = None
+                if os.path.exists(obj_path):
+                    try:
+                        with open(obj_path, "rb") as f:
+                            raw_bytes = f.read()
+                    except Exception:
+                        pass
+
+                if raw_bytes is None:
+                    # Need to download it first
+                    path, content, success = self._fetch_object(sha1)
+                    if success and content:
+                        obj_dir = os.path.join(self.git_dir, "objects", prefix)
+                        safe_makedirs(obj_dir)
+                        try:
+                            with open(obj_path, "wb") as f:
+                                f.write(content)
+                            raw_bytes = content
+                        except Exception:
+                            continue
+                    else:
+                        continue
+
+                # Decompress and find referenced hashes
+                obj_type, obj_content = self._decompress_object(raw_bytes)
+                if obj_type is None:
+                    continue
+
+                referenced = self._extract_hashes_from_object(obj_type, obj_content)
+                for h in referenced:
+                    if h not in all_objects:
+                        all_objects.add(h)
+                        to_process.append(h)
+
+        return all_objects
+
     def _download_objects(self, objects):
         """Download a set of git objects.
 
@@ -352,12 +498,22 @@ class GitDumper:
             else:
                 print_info("No pack files found")
 
-            # Step 3: Discover and download objects
+            # Step 3: Discover and download objects (with recursive resolution)
             if self.fetch_large_files:
                 print_info("Discovering objects from references...")
-                objects = self._discover_objects_from_refs()
-                if objects:
-                    self._download_objects(objects)
+                initial_objects = self._discover_objects_from_refs()
+                if initial_objects:
+                    print_info(f"Found {len(initial_objects)} initial object(s) from refs")
+                    # Recursively discover all referenced objects (commit->tree->blob)
+                    print_info("Recursively resolving object references...")
+                    all_objects = self._discover_referenced_objects(initial_objects)
+                    new_objects = all_objects - initial_objects
+                    if new_objects:
+                        print_success(
+                            f"Discovered {len(new_objects)} additional object(s) "
+                            f"from tree/blob references"
+                        )
+                    self._download_objects(all_objects)
                 else:
                     print_info("No additional objects discovered from references")
 

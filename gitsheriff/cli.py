@@ -26,10 +26,12 @@ def cmd_find(args):
     urls = []
     if args.urls:
         urls = args.urls
-    elif not sys.stdin.isatty():
+    if args.urls_flag:
+        urls.extend(args.urls_flag)
+    if not urls and not sys.stdin.isatty():
         urls = [line.strip() for line in sys.stdin if line.strip()]
-    else:
-        print_error("No URLs provided. Use --urls or pipe from stdin.")
+    if not urls:
+        print_error("No URLs provided. Pass URLs as arguments, use --urls, or pipe from stdin.")
         return 1
 
     try:
@@ -175,9 +177,15 @@ def build_parser():
         description="Scan one or more URLs for exposed .git directories and sensitive files.",
     )
     find_parser.add_argument(
+        "urls",
+        nargs="*",
+        help="URL(s) to scan (positional)",
+    )
+    find_parser.add_argument(
         "--urls", "-u",
         nargs="+",
-        help="URL(s) to scan",
+        dest="urls_flag",
+        help="URL(s) to scan (flag)",
     )
     find_parser.add_argument(
         "--output", "-o",

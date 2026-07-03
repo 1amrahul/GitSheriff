@@ -17,7 +17,7 @@ except ImportError:
 
 from .utils import (
     Colors, print_info, print_success, print_warning, print_error,
-    print_section, format_size,
+    print_section, print_found, print_not_found, format_size,
 )
 
 
