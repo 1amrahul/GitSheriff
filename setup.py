@@ -5,7 +5,7 @@ setup(
     version="2.0.0",
     author="Rahul",
     author_email="rahul@rahulms.qzz.io",
-    description="A .git exposure detection, dumping, and recovery toolkit",
+    description="A .git exposure detection, dumping, recovery, and sensitive data scanning toolkit",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/1amrahul/GitSheriff",
@@ -23,6 +23,11 @@ setup(
             "gitsheriff=gitsheriff.cli:main",
         ],
     },
+    license_file="LICENSE",
+    keywords=[
+        "git", "security", "exposure", "bug-bounty", "penetration-testing",
+        "recon", "osint", "sensitive-data", "secret-scanning", "dotenv",
+    ],
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Information Technology",

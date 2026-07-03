@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitsheriff"
+version = "2.0.0"
+description = "A .git exposure detection, dumping, recovery, and sensitive data scanning toolkit"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Rahul", email = "rahul@rahulms.qzz.io"}
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.0",
+]
+keywords = [
+    "git",
+    "security",
+    "exposure",
+    "bug-bounty",
+    "penetration-testing",
+    "recon",
+    "osint",
+    "sensitive-data",
+    "secret-scanning",
+    "dotenv",
+    "credential-leak",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.urls]
+Homepage = "https://github.com/1amrahul/GitSheriff"
+Documentation = "https://github.com/1amrahul/GitSheriff#readme"
+Repository = "https://github.com/1amrahul/GitSheriff"
+Issues = "https://github.com/1amrahul/GitSheriff/issues"
+
+[project.scripts]
+gitsheriff = "gitsheriff.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gitsheriff*"]
